@@ -5,10 +5,14 @@ project(univiewer C)
 # Windows: pass -DSDL2_DIR=<SDL2-devel-VC>/cmake on the command line
 #          (build.ps1 does this automatically)
 # Linux:   sudo apt install libsdl2-dev
-find_package(SDL2 QUIET)
-if(NOT SDL2_FOUND)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(SDL2 REQUIRED sdl2)
+if(WIN32)
+    find_package(SDL2 REQUIRED)
+else()
+    find_package(SDL2 QUIET)
+    if(NOT SDL2_FOUND)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(SDL2 REQUIRED sdl2)
+    endif()
 endif()
 
 # Target -------------------------------------------------------------
