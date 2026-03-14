@@ -52,6 +52,14 @@
 #include <stdint.h>
 #include <math.h>
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <dirent.h>
+#  include <sys/stat.h>
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Constants                                                            */
 /* ------------------------------------------------------------------ */
@@ -633,6 +641,268 @@ static void draw_tooltip(SDL_Renderer *r, int x, int y, const UniObj *o)
         draw_str(r, tx+2, ty+2+i*10, lines[i], 220, 220, 100);
 }
 
+/* ================================================================== */
+/* File browser (SDL-native, no OS dialogs — Linux + Windows)         */
+/* ================================================================== */
+#define FB_ROW_H   11       /* pixels per row in the file list  */
+#define FB_MAX_ENT 1024     /* max entries per directory scan   */
+
+typedef struct { char name[256]; int is_dir; } FBEntry;
+
+typedef struct {
+    int     active;         /* browser is open                  */
+    int     confirmed;      /* user chose a file                */
+    char    dir[512];       /* current directory                */
+    char    result[512];    /* full path of chosen file         */
+    FBEntry entries[FB_MAX_ENT];
+    int     nentries, selected, scroll;
+} FileBrowser;
+
+static FileBrowser g_fb;
+
+static int fb_cmp(const void *a, const void *b)
+{
+    const FBEntry *ea = (const FBEntry *)a, *eb = (const FBEntry *)b;
+    if (ea->is_dir != eb->is_dir) return eb->is_dir - ea->is_dir;
+    const char *p = ea->name, *q = eb->name;
+    for (;;) {
+        unsigned char ca = (unsigned char)*p++, cb = (unsigned char)*q++;
+        if (ca>='a'&&ca<='z') ca-=32;
+        if (cb>='a'&&cb<='z') cb-=32;
+        if (ca != cb) return (int)ca - (int)cb;
+        if (!ca) return 0;
+    }
+}
+
+static int fb_is_uni(const char *n)
+{
+    int l = (int)strlen(n);
+    if (l < 5) return 0;
+    const char *e = n + l - 4;
+    return e[0]=='.' && (e[1]=='U'||e[1]=='u') &&
+           (e[2]=='N'||e[2]=='n') && (e[3]=='I'||e[3]=='i');
+}
+
+static void fb_list(FileBrowser *fb)
+{
+    fb->nentries = fb->selected = fb->scroll = 0;
+#ifdef _WIN32
+    char pat[520];
+    snprintf(pat, sizeof(pat), "%s\\*", fb->dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            const char *n = fd.cFileName;
+            if (strcmp(n, ".") == 0) continue;
+            int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (!is_dir && !fb_is_uni(n)) continue;
+            if (fb->nentries < FB_MAX_ENT) {
+                strncpy(fb->entries[fb->nentries].name, n, 255);
+                fb->entries[fb->nentries].name[255] = '\0';
+                fb->entries[fb->nentries].is_dir = is_dir;
+                fb->nentries++;
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    DIR *d = opendir(fb->dir);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) && fb->nentries < FB_MAX_ENT) {
+            const char *n = de->d_name;
+            if (strcmp(n, ".") == 0) continue;
+            int is_dir = 0;
+#ifdef DT_DIR
+            if      (de->d_type == DT_DIR)     is_dir = 1;
+            else if (de->d_type == DT_UNKNOWN) {
+#endif
+                char full[520];
+                snprintf(full, sizeof(full), "%s/%s", fb->dir, n);
+                struct stat st;
+                if (stat(full, &st) == 0) is_dir = S_ISDIR(st.st_mode);
+#ifdef DT_DIR
+            }
+#endif
+            if (!is_dir && !fb_is_uni(n)) continue;
+            strncpy(fb->entries[fb->nentries].name, n, 255);
+            fb->entries[fb->nentries].name[255] = '\0';
+            fb->entries[fb->nentries].is_dir = is_dir;
+            fb->nentries++;
+        }
+        closedir(d);
+    }
+#endif
+    qsort(fb->entries, fb->nentries, sizeof(FBEntry), fb_cmp);
+}
+
+static void fb_go_up(FileBrowser *fb)
+{
+    int len = (int)strlen(fb->dir);
+    while (len > 1 && (fb->dir[len-1]=='/'||fb->dir[len-1]=='\\'))
+        fb->dir[--len] = '\0';
+    int last = -1;
+    for (int i = 0; i < len; i++)
+        if (fb->dir[i]=='/'||fb->dir[i]=='\\') last = i;
+    if      (last > 0) { fb->dir[last] = '\0'; }
+    else if (last == 0){ fb->dir[1]    = '\0'; } /* "/" root */
+#ifdef _WIN32
+    if (strlen(fb->dir) == 2 && fb->dir[1] == ':') {
+        fb->dir[2] = '\\'; fb->dir[3] = '\0'; /* "C:" -> "C:\" */
+    }
+#endif
+}
+
+static void fb_open(FileBrowser *fb, const char *uni_path)
+{
+    strncpy(fb->dir, uni_path, sizeof(fb->dir)-1);
+    fb->dir[sizeof(fb->dir)-1] = '\0';
+    int len = (int)strlen(fb->dir);
+    for (int i = len-1; i >= 0; i--) {
+        if (fb->dir[i]=='/'||fb->dir[i]=='\\') { fb->dir[i]='\0'; break; }
+        if (i == 0) strcpy(fb->dir, ".");
+    }
+    if (!fb->dir[0]) strcpy(fb->dir, ".");
+    fb->confirmed = 0;
+    fb->result[0] = '\0';
+    fb->active    = 1;
+    fb_list(fb);
+}
+
+static void fb_enter(FileBrowser *fb)
+{
+    if (fb->selected < 0 || fb->selected >= fb->nentries) return;
+    FBEntry *e = &fb->entries[fb->selected];
+    if (e->is_dir) {
+        if (strcmp(e->name, "..") == 0) {
+            fb_go_up(fb);
+        } else {
+            char tmp[512];
+            int len = (int)strlen(fb->dir);
+            while (len > 1 && (fb->dir[len-1]=='/'||fb->dir[len-1]=='\\')) len--;
+            snprintf(tmp, sizeof(tmp), "%.*s/%s", len, fb->dir, e->name);
+            strncpy(fb->dir, tmp, sizeof(fb->dir)-1);
+            fb->dir[sizeof(fb->dir)-1] = '\0';
+        }
+        fb_list(fb);
+    } else {
+        int len = (int)strlen(fb->dir);
+        while (len > 1 && (fb->dir[len-1]=='/'||fb->dir[len-1]=='\\')) len--;
+        snprintf(fb->result, sizeof(fb->result), "%.*s/%s", len, fb->dir, e->name);
+        fb->confirmed = 1;
+        fb->active    = 0;
+    }
+}
+
+static void fb_draw(FileBrowser *fb, SDL_Renderer *rend, int ww, int wh)
+{
+    /* dark overlay behind the box */
+    SDL_SetRenderDrawColor(rend, 0, 0, 0, 180);
+    SDL_Rect full = {0, 0, ww, wh};
+    SDL_RenderFillRect(rend, &full);
+
+    int bx = ww/8, bw = ww*3/4, by = 20, bh = wh - 40;
+
+    SDL_SetRenderDrawColor(rend, 18, 18, 32, 245);
+    SDL_Rect box = {bx, by, bw, bh};
+    SDL_RenderFillRect(rend, &box);
+    SDL_SetRenderDrawColor(rend, 100, 100, 200, 255);
+    SDL_RenderDrawRect(rend, &box);
+
+    /* title + current path */
+    draw_str(rend, bx+4, by+3,  "OPEN UNIVERSE FILE", 220, 220, 80);
+    {
+        const char *p = fb->dir;
+        int dlen = (int)strlen(p), maxc = (bw-8)/8;
+        if (dlen > maxc) p += dlen - maxc;
+        draw_str(rend, bx+4, by+13, p, 150, 150, 200);
+    }
+    SDL_SetRenderDrawColor(rend, 70, 70, 120, 255);
+    SDL_RenderDrawLine(rend, bx+1, by+23, bx+bw-2, by+23);
+
+    /* file list */
+    int lx = bx+6, ly = by+25, lh = bh - 38;
+    int vis = lh / FB_ROW_H;
+
+    if (fb->selected < fb->scroll)           fb->scroll = fb->selected;
+    if (fb->selected >= fb->scroll + vis)    fb->scroll = fb->selected - vis + 1;
+    if (fb->scroll < 0)                      fb->scroll = 0;
+    if (vis > 0 && fb->nentries > vis && fb->scroll > fb->nentries - vis)
+        fb->scroll = fb->nentries - vis;
+
+    for (int i = 0; i < vis; i++) {
+        int idx = fb->scroll + i;
+        if (idx >= fb->nentries) break;
+        FBEntry *e = &fb->entries[idx];
+        int ry = ly + i * FB_ROW_H;
+        if (idx == fb->selected) {
+            SDL_SetRenderDrawColor(rend, 40, 55, 120, 255);
+            SDL_Rect sel = {bx+1, ry, bw-8, FB_ROW_H};
+            SDL_RenderFillRect(rend, &sel);
+        }
+        uint8_t r = e->is_dir ? 255 : 200;
+        uint8_t g = e->is_dir ? 220 : 220;
+        uint8_t b = e->is_dir ?  60 : 200;
+        char label[270];
+        if (e->is_dir) snprintf(label, sizeof(label), "%s/", e->name);
+        else           strncpy (label, e->name, sizeof(label)-1);
+        label[sizeof(label)-1] = '\0';
+        int maxc = (bw - 20) / 8;
+        if ((int)strlen(label) > maxc) label[maxc] = '\0';
+        draw_str(rend, lx, ry+1, label, r, g, b);
+    }
+
+    /* scrollbar */
+    if (fb->nentries > vis) {
+        int sx = bx+bw-6, th = lh * vis / fb->nentries;
+        if (th < 6) th = 6;
+        int ty = ly + (fb->scroll * (lh - th)) / (fb->nentries > vis ? fb->nentries - vis : 1);
+        SDL_SetRenderDrawColor(rend, 50, 50, 90, 255);
+        SDL_Rect tr = {sx, ly, 4, lh}; SDL_RenderFillRect(rend, &tr);
+        SDL_SetRenderDrawColor(rend, 130, 130, 200, 255);
+        SDL_Rect tt = {sx, ty, 4, th}; SDL_RenderFillRect(rend, &tt);
+    }
+
+    /* bottom hint */
+    SDL_SetRenderDrawColor(rend, 70, 70, 120, 255);
+    SDL_RenderDrawLine(rend, bx+1, by+bh-12, bx+bw-2, by+bh-12);
+    draw_str(rend, bx+4, by+bh-11,
+        "Enter/dbl-click=open  Backspace=up  Esc=cancel  Up/Dn=navigate",
+        120, 120, 180);
+}
+
+/* Handle a left-button click inside the browser; dbl=1 for double-click. */
+static void fb_click(FileBrowser *fb, int mx, int my, int ww, int wh, int dbl)
+{
+    int bx = ww/8, bw = ww*3/4, by = 20, bh = wh - 40;
+    int ly = by + 25, lh = bh - 38, vis = lh / FB_ROW_H;
+    if (mx < bx || mx >= bx+bw || my < ly || my >= ly + vis*FB_ROW_H) return;
+    int idx = fb->scroll + (my - ly) / FB_ROW_H;
+    if (idx < 0 || idx >= fb->nentries) return;
+    if (dbl && idx == fb->selected) fb_enter(fb);
+    else fb->selected = idx;
+}
+
+/* ------------------------------------------------------------------ */
+/* Camera defaults from world content                                  */
+/* ------------------------------------------------------------------ */
+static void compute_init_camera(const UniWorld *world,
+                                float *out_cam_x, float *out_focal)
+{
+    double sw = 0, swx = 0;
+    float  minz = 1e9f;
+    for (int i = 0; i < world->num_objs; i++) {
+        float x = world->objs[i].x, y = world->objs[i].y, z = world->objs[i].z;
+        if (z <= 0 || fabsf(x) > 2000 || fabsf(y) > 1000) continue;
+        double w = 1.0 / z;
+        swx += x * w; sw += w;
+        if (z < minz) minz = z;
+    }
+    *out_cam_x = (float)(sw > 0 ? swx / sw : 0.0);
+    *out_focal = (minz < 1e9f) ? minz : 1.0f;
+}
+
 /* ------------------------------------------------------------------ */
 /* Main                                                                 */
 /* ------------------------------------------------------------------ */
@@ -657,38 +927,27 @@ int main(int argc, char **argv)
     SDL_SetRenderDrawBlendMode(rend, SDL_BLENDMODE_BLEND);
 
     /* --- load universe --- */
+    char cur_path[512];
+    strncpy(cur_path, argv[1], sizeof(cur_path)-1);
+    cur_path[sizeof(cur_path)-1] = '\0';
+
     UniWorld *world = (UniWorld*)calloc(1, sizeof(UniWorld));
-    if (!uni_load(argv[1], world, rend)) {
-        fprintf(stderr, "Failed to load %s\n", argv[1]);
+    if (!uni_load(cur_path, world, rend)) {
+        fprintf(stderr, "Failed to load %s\n", cur_path);
         return 1;
     }
 
-    /* --- compute initial camera from Z-weighted centroid (filter extreme outliers) ---
-     * Coordinates are in screen-pixel units at reference depth.
-     * focal ≈ min_Z so that scale ≈ 1 for the nearest objects (1 world unit = 1 pixel). */
     float init_cam_x = 0.0f, init_focal = 1.0f;
-    {
-        double sw = 0, swx = 0;
-        float  minz = 1e9f;
-        for (int i = 0; i < world->num_objs; i++) {
-            float x = world->objs[i].x, y = world->objs[i].y, z = world->objs[i].z;
-            if (z <= 0 || fabsf(x) > 2000 || fabsf(y) > 1000) continue;
-            double w = 1.0 / z;
-            swx += x * w;  sw += w;
-            if (z < minz) minz = z;
-        }
-        if (sw > 0) init_cam_x = (float)(swx / sw);
-        if (minz < 1e9f) init_focal = minz;
-    }
+    compute_init_camera(world, &init_cam_x, &init_focal);
 
     float cam_x   = init_cam_x;
-    float cam_y   = world->world_y; /* camera eye is at floor height */
-    float cam_z   = 0.0f;           /* looking into +Z */
+    float cam_y   = world->world_y;
+    float cam_z   = 0.0f;
     float focal   = init_focal;
     int   halfy   = world->halfy;
 
-    /* build sort index */
-    int *order = (int*)malloc(world->num_objs * sizeof(int));
+    /* build sort index (fixed-size — no realloc needed on file reload) */
+    int order[MAX_OBJS];
     for (int i = 0; i < world->num_objs; i++) order[i] = i;
     g_sort_objs = world->objs;
     qsort(order, world->num_objs, sizeof(int), obj_cmp_z);
@@ -725,8 +984,7 @@ int main(int argc, char **argv)
 
             case SDL_MOUSEMOTION:
                 mx = ev.motion.x; my = ev.motion.y;
-                if (drag) {
-                    /* pan at a rate of 1 world unit per screen pixel (scale≈1 for near objects) */
+                if (!g_fb.active && drag) {
                     cam_x = drag_cam_x - (float)(mx - drag_sx);
                     cam_z = drag_cam_z + (float)(my - drag_sy) * init_focal;
                 }
@@ -734,18 +992,26 @@ int main(int argc, char **argv)
 
             case SDL_MOUSEBUTTONDOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT) {
-                    drag = 1;
-                    drag_sx = ev.button.x; drag_sy = ev.button.y;
-                    drag_cam_x = cam_x; drag_cam_z = cam_z;
+                    if (g_fb.active) {
+                        fb_click(&g_fb, ev.button.x, ev.button.y,
+                                 ww, wh, ev.button.clicks >= 2);
+                    } else {
+                        drag = 1;
+                        drag_sx = ev.button.x; drag_sy = ev.button.y;
+                        drag_cam_x = cam_x; drag_cam_z = cam_z;
+                    }
                 }
                 break;
 
             case SDL_MOUSEBUTTONUP:
-                if (ev.button.button == SDL_BUTTON_LEFT) drag = 0;
+                if (ev.button.button == SDL_BUTTON_LEFT && !g_fb.active) drag = 0;
                 break;
 
             case SDL_MOUSEWHEEL:
-                if (!show_map) {
+                if (g_fb.active) {
+                    g_fb.scroll -= ev.wheel.y;
+                    if (g_fb.scroll < 0) g_fb.scroll = 0;
+                } else if (!show_map) {
                     focal += (float)ev.wheel.y * focal * 0.1f;
                     if (focal < 0.001f) focal = 0.001f;
                     if (focal > 1000.0f) focal = 1000.0f;
@@ -757,6 +1023,21 @@ int main(int argc, char **argv)
                 SDL_Keycode k  = ev.key.keysym.sym;
                 int shift = (mod & KMOD_SHIFT) ? 1 : 0;
                 int ctrl  = (mod & KMOD_CTRL)  ? 1 : 0;
+
+                /* ---- file browser key handling ---- */
+                if (g_fb.active) {
+                    int vis = ((wh - 40) - 38) / FB_ROW_H;
+                    if (k == SDLK_ESCAPE)   { g_fb.active = 0; break; }
+                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER) { fb_enter(&g_fb); break; }
+                    if (k == SDLK_BACKSPACE) { fb_go_up(&g_fb); fb_list(&g_fb); break; }
+                    if (k == SDLK_UP)   { if (g_fb.selected > 0) g_fb.selected--; break; }
+                    if (k == SDLK_DOWN) { if (g_fb.selected < g_fb.nentries-1) g_fb.selected++; break; }
+                    if (k == SDLK_PAGEUP)   { g_fb.selected -= vis; if (g_fb.selected < 0) g_fb.selected = 0; break; }
+                    if (k == SDLK_PAGEDOWN) { g_fb.selected += vis; if (g_fb.selected >= g_fb.nentries) g_fb.selected = g_fb.nentries-1; break; }
+                    if (k == SDLK_HOME) { g_fb.selected = 0; break; }
+                    if (k == SDLK_END)  { g_fb.selected = g_fb.nentries > 0 ? g_fb.nentries-1 : 0; break; }
+                    break; /* swallow all other keys while browser is open */
+                }
 
                 if (k == SDLK_ESCAPE) { running = 0; break; }
                 if (k == SDLK_TAB || ev.key.keysym.scancode == SDL_SCANCODE_TAB) {
@@ -771,6 +1052,7 @@ int main(int argc, char **argv)
                 }
                 if (k == SDLK_PLUS  || k == SDLK_EQUALS || k == SDLK_KP_PLUS)  { focal *= 1.2f; break; }
                 if (k == SDLK_MINUS || k == SDLK_KP_MINUS) { focal /= 1.2f; if(focal<0.001f)focal=0.001f; break; }
+                if (k == SDLK_o && !shift) { fb_open(&g_fb, cur_path); break; }
 
                 /* Shift+T grid, Shift+B borders, Shift+O objects, Shift+S sky */
                 if (shift) {
@@ -798,6 +1080,31 @@ int main(int argc, char **argv)
             }
             } /* switch */
         } /* event loop */
+
+        /* ---- reload if user chose a new file ---- */
+        if (g_fb.confirmed) {
+            g_fb.confirmed = 0;
+            /* free textures from old world */
+            for (int i = 0; i < world->n_img_files; i++) {
+                ImgFile *f = &world->img_files[i];
+                for (int j = 0; j < f->nimgs; j++)
+                    if (f->imgs[j].tex) { SDL_DestroyTexture(f->imgs[j].tex); f->imgs[j].tex = NULL; }
+            }
+            memset(world, 0, sizeof(UniWorld));
+            strncpy(cur_path, g_fb.result, sizeof(cur_path)-1);
+            cur_path[sizeof(cur_path)-1] = '\0';
+            if (uni_load(cur_path, world, rend)) {
+                compute_init_camera(world, &init_cam_x, &init_focal);
+                cam_x = init_cam_x; cam_y = world->world_y;
+                cam_z = 0.0f;       focal = init_focal;
+                halfy = world->halfy;
+                for (int i = 0; i < world->num_objs; i++) order[i] = i;
+                g_sort_objs = world->objs;
+                qsort(order, world->num_objs, sizeof(int), obj_cmp_z);
+            } else {
+                fprintf(stderr, "Failed to load %s\n", cur_path);
+            }
+        }
 
         /* ---- render ---- */
         int cx = ww / 2;
@@ -904,6 +1211,7 @@ int main(int argc, char **argv)
 
 #undef MAP_SX
 #undef MAP_SZ
+            if (g_fb.active) fb_draw(&g_fb, rend, ww, wh);
             SDL_RenderPresent(rend);
             continue;  /* skip 3D render this frame */
         }
@@ -1016,13 +1324,14 @@ int main(int argc, char **argv)
             SDL_Rect hudbar = {0, 0, ww, 25};
             SDL_RenderFillRect(rend, &hudbar);
             draw_str(rend, 4, 4, hud, 200, 200, 200);
-            draw_str(rend, 4, 14, "Shift=2x  Ctrl+up/dn=eye height  Shift+T=grid  B=borders  O=objs  S=sky  +/-=zoom", 140, 140, 140);
+            draw_str(rend, 4, 14, "O=open  Shift=2x  Ctrl+up/dn=eye  Shift+T=grid  B=borders  Shift+O=objs  S=sky  +/-=zoom", 140, 140, 140);
         }
 
         /* tooltip */
         if (hover_idx >= 0)
             draw_tooltip(rend, mx, my, &world->objs[hover_idx]);
 
+        if (g_fb.active) fb_draw(&g_fb, rend, ww, wh);
         SDL_RenderPresent(rend);
     }
 
@@ -1032,7 +1341,6 @@ int main(int argc, char **argv)
         for (int j = 0; j < f->nimgs; j++)
             if (f->imgs[j].tex) SDL_DestroyTexture(f->imgs[j].tex);
     }
-    free(order);
     free(world);
     SDL_DestroyRenderer(rend);
     SDL_DestroyWindow(win);
