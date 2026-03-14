@@ -45,7 +45,7 @@
  *   Palette data: NUMC × 2 bytes BGR555 (R=bits14-10, G=9-5, B=4-0)
  */
 
-#include <SDL2/SDL.h>
+#include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
